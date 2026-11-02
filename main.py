@@ -5,9 +5,11 @@ from pathlib import Path
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from basic_pitch.inference import predict_and_save
+from basic_pitch import ICASSP_2022_MODEL_PATH
+from basic_pitch.inference import predict_and_save, Model
 
 app = FastAPI(title="Vocalis")
+basic_pitch_model = Model(ICASSP_2022_MODEL_PATH)
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -62,6 +64,7 @@ async def upload_file(file: UploadFile = File(...)):
                 sonify_midi=False,
                 save_model_outputs=False,
                 save_notes=False,
+                model_or_model_path=basic_pitch_model,
             )
 
             generated_midi_name = f"{temp_audio_name.rsplit('.', 1)[0]}_basic_pitch.mid"

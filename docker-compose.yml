@@ -5,6 +5,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
+      - ./main.py:/app/main.py
       - ./uploads:/app/uploads
       - ./static:/app/static
     restart: unless-stopped

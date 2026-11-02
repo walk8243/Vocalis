@@ -31,63 +31,103 @@ def index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/api/files")
+def list_files():
+    files = []
+    for p in UPLOAD_DIR.iterdir():
+        if p.is_file() and p.suffix.lower() in MIDI_EXTENSIONS and not p.name.startswith("temp_"):
+            stat = p.stat()
+            files.append(
+                {
+                    "filename": p.name,
+                    "midi_url": f"/uploads/{p.name}",
+                    "mtime": stat.st_mtime,
+                    "size": stat.st_size,
+                }
+            )
+    files.sort(key=lambda x: x["mtime"], reverse=True)
+    return {"files": files}
+
+
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
-    suffix = Path(file.filename).suffix.lower()
-    file_id = uuid.uuid4().hex[:10]
+    raw_name = Path(file.filename).name
+    suffix = Path(raw_name).suffix.lower()
+    stem = Path(raw_name).stem
 
-    # 1. MIDIファイルが送られた場合: そのまま uploads/ に保存
-    if suffix in MIDI_EXTENSIONS:
-        target_name = f"{file_id}_{file.filename}"
-        target_path = UPLOAD_DIR / target_name
-
-        with open(target_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        return {"filename": target_name, "midi_url": f"/uploads/{target_name}"}
-
-    # 2. 音声ファイルが送られた場合: 一時保存して basic-pitch で変換
-    elif suffix in AUDIO_EXTENSIONS:
-        temp_audio_name = f"temp_{file_id}{suffix}"
-        temp_audio_path = UPLOAD_DIR / temp_audio_name
-
-        with open(temp_audio_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        try:
-            # basic-pitch による推論 & uploads/ への直接MIDI保存
-            # 出力名は: {temp_audio_name}_basic_pitch.mid となる
-            predict_and_save(
-                audio_path_list=[str(temp_audio_path)],
-                output_directory=str(UPLOAD_DIR),
-                save_midi=True,
-                sonify_midi=False,
-                save_model_outputs=False,
-                save_notes=False,
-                model_or_model_path=basic_pitch_model,
-            )
-
-            generated_midi_name = f"{temp_audio_name.rsplit('.', 1)[0]}_basic_pitch.mid"
-            final_midi_name = f"{file_id}_{Path(file.filename).stem}.mid"
-
-            # 扱いやすいファイル名にリネーム
-            generated_midi_path = UPLOAD_DIR / generated_midi_name
-            final_midi_path = UPLOAD_DIR / final_midi_name
-
-            if generated_midi_path.exists():
-                generated_midi_path.rename(final_midi_path)
-            else:
-                raise HTTPException(status_code=500, detail="MIDI generation failed.")
-
-            return {"filename": final_midi_name, "midi_url": f"/uploads/{final_midi_name}"}
-
-        finally:
-            # 抽出完了後、一時音声ファイルは削除
-            if temp_audio_path.exists():
-                temp_audio_path.unlink()
-
-    else:
+    if suffix not in (AUDIO_EXTENSIONS | MIDI_EXTENSIONS):
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported file format. Supported: {AUDIO_EXTENSIONS | MIDI_EXTENSIONS}",
         )
+
+    # 1. MIDIファイルが送られた場合: 元のファイル名で uploads/ に保存（既存ならそのまま返す）
+    if suffix in MIDI_EXTENSIONS:
+        target_name = raw_name
+        target_path = UPLOAD_DIR / target_name
+
+        if target_path.exists():
+            return {
+                "filename": target_name,
+                "midi_url": f"/uploads/{target_name}",
+                "cached": True,
+            }
+
+        with open(target_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        return {
+            "filename": target_name,
+            "midi_url": f"/uploads/{target_name}",
+            "cached": False,
+        }
+
+    # 2. 音声ファイルが送られた場合: 同名の .mid が既に存在すれば変換をスキップ
+    final_midi_name = f"{stem}.mid"
+    final_midi_path = UPLOAD_DIR / final_midi_name
+
+    if final_midi_path.exists():
+        return {
+            "filename": final_midi_name,
+            "midi_url": f"/uploads/{final_midi_name}",
+            "cached": True,
+        }
+
+    file_id = uuid.uuid4().hex[:10]
+    temp_audio_name = f"temp_{file_id}{suffix}"
+    temp_audio_path = UPLOAD_DIR / temp_audio_name
+
+    with open(temp_audio_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    try:
+        # basic-pitch による推論 & uploads/ への直接MIDI保存
+        # 出力名は: {temp_audio_name}_basic_pitch.mid となる
+        predict_and_save(
+            audio_path_list=[str(temp_audio_path)],
+            output_directory=str(UPLOAD_DIR),
+            save_midi=True,
+            sonify_midi=False,
+            save_model_outputs=False,
+            save_notes=False,
+            model_or_model_path=basic_pitch_model,
+        )
+
+        generated_midi_name = f"{temp_audio_name.rsplit('.', 1)[0]}_basic_pitch.mid"
+        generated_midi_path = UPLOAD_DIR / generated_midi_name
+
+        if generated_midi_path.exists():
+            generated_midi_path.replace(final_midi_path)
+        else:
+            raise HTTPException(status_code=500, detail="MIDI generation failed.")
+
+        return {
+            "filename": final_midi_name,
+            "midi_url": f"/uploads/{final_midi_name}",
+            "cached": False,
+        }
+
+    finally:
+        # 抽出完了後、一時音声ファイルは削除
+        if temp_audio_path.exists():
+            temp_audio_path.unlink()

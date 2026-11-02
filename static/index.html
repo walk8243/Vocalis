@@ -62,6 +62,51 @@
       color: #8ab4f8;
     }
 
+    .saved-files-section {
+      background: #1a1a1a;
+      border: 1px solid #2a2a2a;
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+      display: none;
+      flex-direction: column;
+      gap: 0.6rem;
+    }
+
+    .saved-files-title {
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #aaa;
+    }
+
+    .saved-files-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+
+    .file-chip {
+      background: #26262e;
+      color: #e0e0e0;
+      border: 1px solid #3a3a46;
+      border-radius: 6px;
+      padding: 0.4rem 0.75rem;
+      font-size: 0.85rem;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+
+    .file-chip:hover {
+      background: #323242;
+      border-color: #646cff;
+    }
+
+    .file-chip.active {
+      background: #36397a;
+      border-color: #8ab4f8;
+      color: #fff;
+      font-weight: 600;
+    }
+
     .viewer-card {
       background: #1e1e1e;
       border-radius: 8px;
@@ -186,6 +231,11 @@
       <input type="file" id="fileInput" accept=".wav,.mp3,.ogg,.flac,.m4a,.mid,.midi" style="display: none;">
     </div>
 
+    <div class="saved-files-section" id="savedFilesSection">
+      <div class="saved-files-title">保存済みのMIDIファイル（クリックで表示）</div>
+      <div class="saved-files-list" id="savedFilesList"></div>
+    </div>
+
     <div class="status" id="statusText"></div>
 
     <div class="viewer-card" id="viewerCard">
@@ -229,10 +279,14 @@
     const keysCanvas = document.getElementById('keysCanvas');
     const rollCanvas = document.getElementById('rollCanvas');
     const rollScroll = document.getElementById('rollScroll');
+    const savedFilesSection = document.getElementById('savedFilesSection');
+    const savedFilesList = document.getElementById('savedFilesList');
 
     const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
     const BLACK_KEYS = new Set([1, 3, 6, 8, 10]);
 
+    let savedFiles = [];
+    let currentFilename = null;
     let currentMidi = null;
     let allNotes = [];
     let minPitch = 48; // C3
@@ -294,9 +348,66 @@
       stopPlayback(true);
     });
 
+    async function fetchSavedFiles() {
+      try {
+        const res = await fetch('/api/files');
+        if (!res.ok) return;
+        const data = await res.json();
+        savedFiles = data.files || [];
+        renderSavedFilesList();
+      } catch (err) {
+        console.error('Failed to fetch saved files:', err);
+      }
+    }
+
+    function renderSavedFilesList() {
+      if (savedFiles.length === 0) {
+        savedFilesSection.style.display = 'none';
+        return;
+      }
+      savedFilesSection.style.display = 'flex';
+      savedFilesList.innerHTML = '';
+
+      for (const item of savedFiles) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'file-chip' + (item.filename === currentFilename ? ' active' : '');
+        btn.textContent = item.filename;
+        btn.addEventListener('click', async () => {
+          stopPlayback(true);
+          statusText.textContent = `保存済み MIDI (${item.filename}) を読み込み中...`;
+          try {
+            await loadAndRenderMidi(item.midi_url, item.filename);
+            statusText.textContent = '読み込み完了！（保存済みファイル）';
+          } catch (err) {
+            statusText.textContent = `エラー: ${err.message}`;
+          }
+        });
+        savedFilesList.appendChild(btn);
+      }
+    }
+
     async function handleFile(file) {
       stopPlayback(true);
-      const isMidi = file.name.toLowerCase().endsWith('.mid') || file.name.toLowerCase().endsWith('.midi');
+      const lowerName = file.name.toLowerCase();
+      const isMidi = lowerName.endsWith('.mid') || lowerName.endsWith('.midi');
+      const stem = file.name.replace(/\.[^/.]+$/, '');
+      const expectedMidiName = isMidi ? file.name : `${stem}.mid`;
+
+      // 既に uploads/ に対応する MIDI ファイルがある場合はアップロード・再変換せず直接表示
+      const existing = savedFiles.find((f) => f.filename === expectedMidiName);
+      if (existing) {
+        statusText.textContent = `保存済み MIDI (${existing.filename}) が見つかったため直接読み込み中...`;
+        try {
+          await loadAndRenderMidi(existing.midi_url, existing.filename);
+          statusText.textContent = '読み込み完了！（アップロード・変換をスキップしました）';
+          return;
+        } catch (err) {
+          statusText.textContent = `エラー: ${err.message}`;
+          return;
+        }
+      }
+
       statusText.textContent = isMidi ? 'MIDI を取り込み中...' : '音声を解析して MIDI を抽出中（少々お待ちください）...';
       viewerCard.style.display = 'none';
 
@@ -313,16 +424,21 @@
         const data = await res.json();
         statusText.textContent = 'MIDI を解析・描画中...';
 
+        await fetchSavedFiles();
         await loadAndRenderMidi(data.midi_url, data.filename);
-        statusText.textContent = '読み込み完了！';
+        statusText.textContent = data.cached
+          ? '読み込み完了！（サーバー内の既存ファイルを表示）'
+          : '読み込み完了！';
       } catch (err) {
         statusText.textContent = `エラー: ${err.message}`;
       }
     }
 
     async function loadAndRenderMidi(midiUrl, filename) {
-      const midi = await Midi.fromUrl(midiUrl);
+      const midi = await Midi.fromUrl(encodeURI(midiUrl));
       currentMidi = midi;
+      currentFilename = filename;
+      renderSavedFilesList();
 
       // 全トラックからノートを集約
       allNotes = [];
@@ -605,6 +721,8 @@
         synth.releaseAll();
       }
     }
+
+    fetchSavedFiles();
   </script>
 </body>
 

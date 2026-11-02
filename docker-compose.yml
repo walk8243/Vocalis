@@ -1,0 +1,10 @@
+services:
+  app:
+    build: .
+    container_name: vocalis-app
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./static:/app/static
+    restart: unless-stopped

@@ -1,0 +1,433 @@
+"use strict";
+// DOM要素の取得
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+const statusText = document.getElementById('statusText');
+const viewerCard = document.getElementById('viewerCard');
+const fileInfo = document.getElementById('fileInfo');
+const metaInfo = document.getElementById('metaInfo');
+const playBtn = document.getElementById('playBtn');
+const stopBtn = document.getElementById('stopBtn');
+const timeDisplay = document.getElementById('timeDisplay');
+const downloadLink = document.getElementById('downloadLink');
+const zoomRange = document.getElementById('zoomRange');
+const keysCanvas = document.getElementById('keysCanvas');
+const rollCanvas = document.getElementById('rollCanvas');
+const rollScroll = document.getElementById('rollScroll');
+const savedFilesSection = document.getElementById('savedFilesSection');
+const savedFilesList = document.getElementById('savedFilesList');
+const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+const BLACK_KEYS = new Set([1, 3, 6, 8, 10]);
+let savedFiles = [];
+let currentFilename = null;
+let currentMidi = null;
+let allNotes = [];
+let minPitch = 48; // C3
+let maxPitch = 84; // C6
+let totalDuration = 0;
+let pixelsPerSecond = Number(zoomRange.value);
+// 再生状態管理
+let synth = null;
+let isPlaying = false;
+let playbackOffset = 0;
+let playStartWallTime = 0;
+let scheduledEvents = [];
+let animFrameId = null;
+dropzone.addEventListener('click', () => fileInput.click());
+dropzone.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    dropzone.classList.add('dragover');
+});
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+dropzone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropzone.classList.remove('dragover');
+    if (e.dataTransfer && e.dataTransfer.files.length > 0) {
+        handleFile(e.dataTransfer.files[0]);
+    }
+});
+fileInput.addEventListener('change', () => {
+    if (fileInput.files && fileInput.files.length > 0) {
+        handleFile(fileInput.files[0]);
+    }
+});
+zoomRange.addEventListener('input', () => {
+    pixelsPerSecond = Number(zoomRange.value);
+    if (currentMidi)
+        renderPianoRoll(getCurrentTime());
+});
+rollScroll.addEventListener('click', (e) => {
+    if (!currentMidi)
+        return;
+    const rect = rollCanvas.getBoundingClientRect();
+    const clickX = e.clientX - rect.left;
+    const targetTime = Math.max(0, Math.min(totalDuration, clickX / pixelsPerSecond));
+    const wasPlaying = isPlaying;
+    stopPlayback(false);
+    playbackOffset = targetTime;
+    updateTimeDisplay(playbackOffset);
+    renderPianoRoll(playbackOffset);
+    if (wasPlaying)
+        void startPlayback();
+});
+playBtn.addEventListener('click', async () => {
+    if (!currentMidi)
+        return;
+    if (isPlaying) {
+        pausePlayback();
+    }
+    else {
+        await startPlayback();
+    }
+});
+stopBtn.addEventListener('click', () => {
+    stopPlayback(true);
+});
+async function fetchSavedFiles() {
+    try {
+        const res = await fetch('/api/files');
+        if (!res.ok)
+            return;
+        const data = (await res.json());
+        savedFiles = data.files || [];
+        renderSavedFilesList();
+    }
+    catch (err) {
+        console.error('Failed to fetch saved files:', err);
+    }
+}
+function renderSavedFilesList() {
+    if (savedFiles.length === 0) {
+        savedFilesSection.style.display = 'none';
+        return;
+    }
+    savedFilesSection.style.display = 'flex';
+    savedFilesList.innerHTML = '';
+    for (const item of savedFiles) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'file-chip' + (item.filename === currentFilename ? ' active' : '');
+        btn.textContent = item.filename;
+        btn.addEventListener('click', async () => {
+            stopPlayback(true);
+            statusText.textContent = `保存済み MIDI (${item.filename}) を読み込み中...`;
+            try {
+                await loadAndRenderMidi(item.midi_url, item.filename);
+                statusText.textContent = '読み込み完了！（保存済みファイル）';
+            }
+            catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                statusText.textContent = `エラー: ${message}`;
+            }
+        });
+        savedFilesList.appendChild(btn);
+    }
+}
+async function handleFile(file) {
+    stopPlayback(true);
+    const lowerName = file.name.toLowerCase();
+    const isMidi = lowerName.endsWith('.mid') || lowerName.endsWith('.midi');
+    const stem = file.name.replace(/\.[^/.]+$/, '');
+    const expectedMidiName = isMidi ? file.name : `${stem}.mid`;
+    // 既に uploads/ に対応する MIDI ファイルがある場合はアップロード・再変換せず直接表示
+    const existing = savedFiles.find((f) => f.filename === expectedMidiName);
+    if (existing) {
+        statusText.textContent = `保存済み MIDI (${existing.filename}) が見つかったため直接読み込み中...`;
+        try {
+            await loadAndRenderMidi(existing.midi_url, existing.filename);
+            statusText.textContent = '読み込み完了！（アップロード・変換をスキップしました）';
+            return;
+        }
+        catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            statusText.textContent = `エラー: ${message}`;
+            return;
+        }
+    }
+    statusText.textContent = isMidi
+        ? 'MIDI を取り込み中...'
+        : '音声を解析して MIDI を抽出中（少々お待ちください）...';
+    viewerCard.style.display = 'none';
+    const formData = new FormData();
+    formData.append('file', file);
+    try {
+        const res = await fetch('/api/upload', { method: 'POST', body: formData });
+        if (!res.ok) {
+            const err = (await res.json());
+            throw new Error(err.detail || 'アップロードに失敗しました');
+        }
+        const data = (await res.json());
+        statusText.textContent = 'MIDI を解析・描画中...';
+        await fetchSavedFiles();
+        await loadAndRenderMidi(data.midi_url, data.filename);
+        statusText.textContent = data.cached
+            ? '読み込み完了！（サーバー内の既存ファイルを表示）'
+            : '読み込み完了！';
+    }
+    catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        statusText.textContent = `エラー: ${message}`;
+    }
+}
+async function loadAndRenderMidi(midiUrl, filename) {
+    const midi = await Midi.fromUrl(encodeURI(midiUrl));
+    currentMidi = midi;
+    currentFilename = filename;
+    renderSavedFilesList();
+    // 全トラックからノートを集約
+    allNotes = [];
+    midi.tracks.forEach((track, trackIdx) => {
+        track.notes.forEach((note) => {
+            allNotes.push({
+                midi: note.midi,
+                name: note.name,
+                time: note.time,
+                duration: note.duration,
+                velocity: note.velocity,
+                trackIdx
+            });
+        });
+    });
+    allNotes.sort((a, b) => a.time - b.time);
+    if (allNotes.length > 0) {
+        let minP = Infinity;
+        let maxP = -Infinity;
+        let maxEnd = 0;
+        for (const n of allNotes) {
+            if (n.midi < minP)
+                minP = n.midi;
+            if (n.midi > maxP)
+                maxP = n.midi;
+            if (n.time + n.duration > maxEnd)
+                maxEnd = n.time + n.duration;
+        }
+        // 上下に余白を持たせる（最低2オクターブ分は確保）
+        minPitch = Math.max(0, minP - 3);
+        maxPitch = Math.min(127, maxP + 3);
+        if (maxPitch - minPitch < 24) {
+            const center = Math.round((minPitch + maxPitch) / 2);
+            minPitch = Math.max(0, center - 12);
+            maxPitch = Math.min(127, center + 12);
+        }
+        totalDuration = Math.max(midi.duration || 0, maxEnd);
+    }
+    else {
+        minPitch = 48;
+        maxPitch = 72;
+        totalDuration = Math.max(midi.duration || 5, 5);
+    }
+    const bpm = midi.header.tempos.length > 0 ? Math.round(midi.header.tempos[0].bpm) : 120;
+    fileInfo.textContent = `表示中: ${filename}`;
+    metaInfo.textContent = `ノート数: ${allNotes.length} | 長さ: ${totalDuration.toFixed(1)}秒 | BPM: ${bpm}`;
+    downloadLink.href = midiUrl;
+    downloadLink.download = filename;
+    viewerCard.style.display = 'flex';
+    playbackOffset = 0;
+    rollScroll.scrollLeft = 0;
+    updateTimeDisplay(0);
+    renderKeys();
+    renderPianoRoll(0);
+}
+function midiToNoteName(midiNumber) {
+    const octave = Math.floor(midiNumber / 12) - 1;
+    const name = NOTE_NAMES[midiNumber % 12];
+    return `${name}${octave}`;
+}
+function renderKeys() {
+    const ctx = keysCanvas.getContext('2d');
+    if (!ctx)
+        return;
+    const width = keysCanvas.width;
+    const height = keysCanvas.height;
+    const numPitches = maxPitch - minPitch + 1;
+    const rowHeight = height / numPitches;
+    ctx.clearRect(0, 0, width, height);
+    for (let i = 0; i < numPitches; i++) {
+        const pitch = maxPitch - i;
+        const y = i * rowHeight;
+        const isBlack = BLACK_KEYS.has(pitch % 12);
+        const isC = pitch % 12 === 0;
+        ctx.fillStyle = isBlack ? '#222' : '#ddd';
+        ctx.fillRect(0, y, width, rowHeight);
+        ctx.strokeStyle = '#555';
+        ctx.lineWidth = 0.5;
+        ctx.beginPath();
+        ctx.moveTo(0, y + rowHeight);
+        ctx.lineTo(width, y + rowHeight);
+        ctx.stroke();
+        // Cの音または行高さが十分ある場合に音名を表示
+        if (isC || rowHeight >= 14) {
+            ctx.fillStyle = isBlack ? '#bbb' : '#222';
+            ctx.font = `${Math.min(11, Math.max(8, Math.floor(rowHeight - 2)))}px sans-serif`;
+            ctx.textBaseline = 'middle';
+            ctx.fillText(midiToNoteName(pitch), 6, y + rowHeight / 2);
+        }
+    }
+}
+function renderPianoRoll(playheadTime = 0) {
+    const numPitches = maxPitch - minPitch + 1;
+    const height = rollCanvas.height;
+    const rowHeight = height / numPitches;
+    const minCanvasWidth = rollScroll.clientWidth || 800;
+    const width = Math.max(minCanvasWidth, Math.ceil((totalDuration + 1) * pixelsPerSecond));
+    if (rollCanvas.width !== width) {
+        rollCanvas.width = width;
+    }
+    const ctx = rollCanvas.getContext('2d');
+    if (!ctx)
+        return;
+    ctx.clearRect(0, 0, width, height);
+    // 1. 背景グリッド（横：音階）
+    for (let i = 0; i < numPitches; i++) {
+        const pitch = maxPitch - i;
+        const y = i * rowHeight;
+        const isBlack = BLACK_KEYS.has(pitch % 12);
+        const isC = pitch % 12 === 0;
+        ctx.fillStyle = isBlack ? '#151518' : '#1b1b20';
+        ctx.fillRect(0, y, width, rowHeight);
+        ctx.strokeStyle = isC ? '#3a3a48' : '#24242c';
+        ctx.lineWidth = isC ? 1 : 0.5;
+        ctx.beginPath();
+        ctx.moveTo(0, y + rowHeight);
+        ctx.lineTo(width, y + rowHeight);
+        ctx.stroke();
+    }
+    // 2. 背景グリッド（縦：秒単位）
+    const totalSeconds = Math.ceil(totalDuration + 1);
+    for (let sec = 0; sec <= totalSeconds; sec++) {
+        const x = sec * pixelsPerSecond;
+        ctx.strokeStyle = sec % 5 === 0 ? '#3a3a48' : '#25252e';
+        ctx.lineWidth = sec % 5 === 0 ? 1 : 0.5;
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, height);
+        ctx.stroke();
+        ctx.fillStyle = '#777';
+        ctx.font = '10px monospace';
+        ctx.fillText(`${sec}s`, x + 4, 12);
+    }
+    // 3. ノート矩形の描画
+    for (const note of allNotes) {
+        if (note.midi < minPitch || note.midi > maxPitch)
+            continue;
+        const x = note.time * pixelsPerSecond;
+        const w = Math.max(3, note.duration * pixelsPerSecond);
+        const y = (maxPitch - note.midi) * rowHeight;
+        const isActive = playheadTime >= note.time && playheadTime <= note.time + note.duration;
+        const alpha = 0.55 + note.velocity * 0.45;
+        ctx.fillStyle = isActive
+            ? '#ff9e44'
+            : `rgba(100, 140, 255, ${alpha.toFixed(2)})`;
+        ctx.strokeStyle = isActive ? '#ffd180' : '#8ab4f8';
+        ctx.lineWidth = 1;
+        const pad = Math.min(1.5, rowHeight * 0.12);
+        ctx.fillRect(x, y + pad, w, Math.max(2, rowHeight - pad * 2));
+        ctx.strokeRect(x, y + pad, w, Math.max(2, rowHeight - pad * 2));
+    }
+    // 4. 再生ヘッド（赤線）
+    const playheadX = playheadTime * pixelsPerSecond;
+    ctx.strokeStyle = '#ff5252';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(playheadX, 0);
+    ctx.lineTo(playheadX, height);
+    ctx.stroke();
+}
+function formatTime(sec) {
+    const m = Math.floor(sec / 60);
+    const s = (sec % 60).toFixed(1).padStart(4, '0');
+    return `${String(m).padStart(2, '0')}:${s}`;
+}
+function updateTimeDisplay(currentSec) {
+    timeDisplay.textContent = `${formatTime(currentSec)} / ${formatTime(totalDuration)}`;
+}
+function getCurrentTime() {
+    if (!isPlaying)
+        return playbackOffset;
+    return playbackOffset + (performance.now() - playStartWallTime) / 1000;
+}
+async function startPlayback() {
+    await Tone.start();
+    if (!synth) {
+        synth = new Tone.PolySynth(Tone.Synth, {
+            oscillator: { type: 'triangle' },
+            envelope: { attack: 0.01, decay: 0.1, sustain: 0.4, release: 0.2 }
+        }).toDestination();
+    }
+    if (playbackOffset >= totalDuration) {
+        playbackOffset = 0;
+        rollScroll.scrollLeft = 0;
+    }
+    isPlaying = true;
+    playBtn.textContent = '⏸ 一時停止';
+    playStartWallTime = performance.now();
+    scheduledEvents = [];
+    for (const note of allNotes) {
+        if (note.time + note.duration < playbackOffset)
+            continue;
+        const delay = Math.max(0, note.time - playbackOffset);
+        const dur = note.time < playbackOffset
+            ? note.duration - (playbackOffset - note.time)
+            : note.duration;
+        if (dur > 0) {
+            const id = window.setTimeout(() => {
+                if (isPlaying && synth) {
+                    synth.triggerAttackRelease(note.name, dur, undefined, note.velocity);
+                }
+            }, delay * 1000);
+            scheduledEvents.push(id);
+        }
+    }
+    const tick = () => {
+        if (!isPlaying)
+            return;
+        const cur = getCurrentTime();
+        if (cur >= totalDuration) {
+            stopPlayback(true);
+            return;
+        }
+        updateTimeDisplay(cur);
+        renderPianoRoll(cur);
+        // 再生ヘッドが画面右端に近づいたら自動スクロール
+        const playheadX = cur * pixelsPerSecond;
+        const viewLeft = rollScroll.scrollLeft;
+        const viewWidth = rollScroll.clientWidth;
+        if (playheadX > viewLeft + viewWidth * 0.85 || playheadX < viewLeft) {
+            rollScroll.scrollLeft = Math.max(0, playheadX - viewWidth * 0.2);
+        }
+        animFrameId = requestAnimationFrame(tick);
+    };
+    animFrameId = requestAnimationFrame(tick);
+}
+function pausePlayback() {
+    playbackOffset = getCurrentTime();
+    clearScheduled();
+    isPlaying = false;
+    playBtn.textContent = '▶ 再生';
+    renderPianoRoll(playbackOffset);
+}
+function stopPlayback(resetToZero = true) {
+    clearScheduled();
+    isPlaying = false;
+    playBtn.textContent = '▶ 再生';
+    if (resetToZero) {
+        playbackOffset = 0;
+    }
+    if (currentMidi) {
+        updateTimeDisplay(playbackOffset);
+        renderPianoRoll(playbackOffset);
+    }
+}
+function clearScheduled() {
+    for (const id of scheduledEvents)
+        clearTimeout(id);
+    scheduledEvents = [];
+    if (animFrameId !== null) {
+        cancelAnimationFrame(animFrameId);
+        animFrameId = null;
+    }
+    if (synth) {
+        synth.releaseAll();
+    }
+}
+void fetchSavedFiles();
